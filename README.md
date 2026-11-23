@@ -84,6 +84,10 @@ pipewire-recorder --virtual-sink run
 - **Spotify selbst**: Den Spotify-internen Regler auf **100 %** lassen und in Spotify **„Lautstärke anpassen“** deaktivieren (diese beiden Schritte passieren im Spotify-Prozess vor PipeWire).
 - **Kein ungewollter Default-Sink**: Der virtuelle Sink wird mit `priority.session = 0` und `priority.driver = 0` angelegt, sodass er niemals versehentlich das Standard-Ausgabegerät übernimmt.
 - **Sauberes Aufräumen beim Beenden**: Beim Stoppen des Daemons (`Ctrl+C` oder `systemctl --user stop pipewire-recorder`) wird die `target.object`-Zuordnung entfernt und `pw-loopback` beendet, sodass Spotify nahtlos wieder über dein reguläres Standard-Ausgabegerät weiterläuft.
+- **EasyEffects-Hinweis (wichtig bei aktivem `virtual_sink`)**:  
+  Wenn **EasyEffects** läuft („Alle Ausgänge verarbeiten“), zieht EasyEffects standardmäßig jeden App-Stream – also auch Spotify – automatisch wieder direkt auf `easyeffects_sink` zurück, wodurch `PipeWire Recorder Playback` umgangen wird.  
+  **Lösung:** Trage `spotify` in die **EasyEffects-Blocklist** ein (in EasyEffects unter *Ausgabe → Blocklist* bzw. in `~/.config/easyeffects/db/easyeffectsrc` unter `[StreamOutputs]` → `blocklist=spotify,Spotify` und EasyEffects neu starten).  
+  EasyEffects verarbeitet danach weiterhin automatisch den Stream **`PipeWire Recorder Playback`**, d. h. du behältst alle EQs/Effekte beim Hören, während die Aufnahme 1:1 unverändert bleibt.
 - **Status prüfen**: Mit `pipewire-recorder status` und `pipewire-recorder list-streams` siehst du den aktiven virtuellen Sink sowie die aktuelle Hörlautstärke des Loopback-Streams.
 
 ---

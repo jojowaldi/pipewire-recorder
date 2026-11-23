@@ -351,6 +351,15 @@ pub async fn find_target_node(target: &str) -> Result<Option<PipeWireNode>> {
 
 pub async fn route_stream_to_sink(node_id: u32, sink_target: &str) -> Result<()> {
     let id_str = node_id.to_string();
+
+    // Clear any stale legacy target.node override (e.g. left behind by EasyEffects)
+    let _ = Command::new("pw-metadata")
+        .args(["-n", "default", "-d", &id_str, "target.node"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await;
+
     let out = Command::new("pw-metadata")
         .args(["-n", "default", &id_str, "target.object", sink_target])
         .stdout(Stdio::piped())
@@ -378,6 +387,13 @@ pub async fn route_stream_to_sink(node_id: u32, sink_target: &str) -> Result<()>
 
 pub async fn clear_stream_route(node_id: u32) -> Result<()> {
     let id_str = node_id.to_string();
+    let _ = Command::new("pw-metadata")
+        .args(["-n", "default", "-d", &id_str, "target.node"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await;
+
     let out = Command::new("pw-metadata")
         .args(["-n", "default", "-d", &id_str, "target.object"])
         .stdout(Stdio::piped())
