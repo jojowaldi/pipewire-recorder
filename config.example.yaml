@@ -33,6 +33,21 @@ stream:
   #   DEAKTIVIERT sein, damit Spotify vor PipeWire keine Normalisierung einrechnet.
   enforce_unity_volume: true
 
+  # Optional: Virtueller Capture-Sink + regelbarer Loopback-Ausgang
+  # Aktivieren (`enabled: true`), um Spotify (oder den Ziel-Player) im Desktop-Mixer unabhängig
+  # von anderen Apps leiser zu drehen oder stummzuschalten, während trotzdem 1:1 mit 100%
+  # aufgenommen wird. Spotify bleibt auf 100%; die Hörlautstärke wird über den separaten
+  # Mixer-Stream `playback_name` (z. B. "PipeWire Recorder Playback") geregelt.
+  virtual_sink:
+    enabled: false
+    sink_name: "pipewire_recorder_capture"
+    sink_description: "PipeWire Recorder Capture (100%)"
+    playback_name: "PipeWire Recorder Playback"
+    # Optionales Ziel für die Hör-Ausgabe (node.name oder object.serial); null = System-Default / EasyEffects
+    playback_target: null
+    # Ziel-Stream automatisch via pw-metadata auf den virtuellen Sink routen
+    auto_route: true
+
 # Regeln für vollständige Song-Aufnahmen
 completeness:
   max_start_offset_ms: 2500

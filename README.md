@@ -5,6 +5,7 @@ Automatischer Hintergrund-Daemon für Linux / PipeWire, der isolierte Audio-Stre
 ## Features
 
 - **Isolierter PipeWire-Abgriff**: Zeichnet ausschließlich den gezielten `Stream/Output/Audio`-Node der App auf (keine Benachrichtigungen, kein Voice-Chat, kein Browser-Audio).
+- **Optionaler virtueller Capture-Sink + Loopback**: Lässt dich die Hörlautstärke von Spotify (oder einem anderen Ziel-Player) im Desktop-Mixer unabhängig von anderen Apps leiser drehen oder stummschalten, während die Aufnahme weiterhin 1:1 bei 100 % läuft.
 - **Lückenlose Track-Übergänge**: Hält `pw-record` über Trackwechsel hinweg aktiv und tauscht den PCM-Buffer exakt an der Trackgrenze, sodass Song-Anfänge nicht abgeschnitten werden.
 - **Strikte Vollständigkeitsprüfung**: Speichert nur Songs, die nahe `0:00` begonnen haben, ohne Seeking/Scrubbing, ohne Pause-Unterbrechungen (`allow_pause: false`) und in voller Track-Länge durchgelaufen sind. Werbung wird automatisch verworfen.
 - **Zweistufige Duplikat-Erkennung**: Prüft sowohl einen persistenten Index (`~/.local/share/pipewire-recorder/recorded_index.json`) als auch ob die Zieldatei auf der Festplatte bereits existiert. Wurde eine Datei manuell gelöscht, wird sie bei erneutem Abspielen wieder aufgenommen.
@@ -26,10 +27,64 @@ Der Daemon nimmt den Audio-Stream **1:1 unverändert** auf (keine Normalisierung
 
 3. **App-Stream-Lautstärke & Spotify-interne Normalisierung (Bitte beachten!)**
    - **App-Mixer (`channelVolumes` am PipeWire-Node) & Spotify-Lautstärkeregler (MPRIS `Volume`)**:  
-     Diese Regler skalieren direkt die Samples, die der Player an PipeWire ausgibt.  
+     Diese Regler skalieren direkt die Samples, die der Player an PipeWire ausgibt – noch bevor die `output_FL`/`output_FR`-Ports des App-Nodes erreicht werden.  
      Standardmäßig ist `stream.enforce_unity_volume: true` aktiv: Der Daemon setzt beim Aufnahmestart sowohl das PipeWire-Node-Volume (`wpctl set-volume <id> 1.0`) als auch das MPRIS-Volume auf `1.0` (100 %) und verwirft die aktuelle Aufnahme sofort (`VolumeAttenuated`), falls während eines Songs die App-Lautstärke heruntergedreht oder stummgeschaltet wird.
+   - **Lösung für unabhängige Hör-Lautstärke (`stream.virtual_sink.enabled: true`)**:  
+     Wenn du Spotify **leiser als andere Apps (z. B. Discord/Browser) hören oder stummschalten** willst, ohne die 100-%-Aufnahme zu beeinflussen, aktiviere den eingebauten **virtuellen Capture-Sink + Loopback** (Details siehe unten).
    - **Spotify-App-Einstellung „Lautstärke anpassen“ (Normalize volume)**:  
      In Spotify selbst muss unter **Einstellungen → Audioqualität → „Lautstärke anpassen“** (*Normalize volume*) **deaktiviert** sein! Ist diese Option in Spotify aktiviert, rechnet der Spotify-Client selbst bereits intern eine ReplayGain-Lautstärkeanpassung in den PCM-Output ein, bevor PipeWire oder der Daemon das Audio zu sehen bekommen.
+
+---
+
+## 🎚️ Unabhängige Hör-Lautstärke (Virtueller Capture-Sink + Loopback)
+
+Da PipeWire `channelVolumes` direkt im `Stream/Output/Audio`-Node einer App anwendet, führt das Leiserdrehen von Spotify im App-Mixer normalerweise dazu, dass auch die Aufnahme leiser wird (bzw. bei `enforce_unity_volume: true` verworfen wird).
+
+Mit **`stream.virtual_sink.enabled: true`** entkoppelt `pipewire-recorder` Aufnahme und Hör-Lautstärke automatisch über `pw-loopback` + `pw-metadata`:
+
+```text
+[Spotify: Stream/Output/Audio (bleibt bei 100 %)]
+   │
+   ├──▶ pw-record --target <spotify-serial>           (1:1 bit-exakte Aufnahme bei 100 %)
+   │
+   └──▶ [pipewire_recorder_capture (virtueller Sink)]
+           │
+           ▼
+        [PipeWire Recorder Playback (Loopback-Stream)] ◀── HIER im Mixer leiser drehen / muten!
+           │
+           ▼
+        [Default Sink / EasyEffects / Kopfhörer]
+```
+
+### Aktivieren in `config.yaml`
+
+```yaml
+stream:
+  mpris_player: "spotify"
+  pipewire_target: "spotify"
+  enforce_unity_volume: true
+  virtual_sink:
+    enabled: true
+    sink_name: "pipewire_recorder_capture"
+    sink_description: "PipeWire Recorder Capture (100%)"
+    playback_name: "PipeWire Recorder Playback"
+    playback_target: null   # null = System-Default (inkl. EasyEffects / Bluetooth-Wechsel)
+    auto_route: true        # routet Spotify automatisch via pw-metadata auf den virtuellen Sink
+```
+
+Oder testweise per CLI-Flag:
+
+```bash
+pipewire-recorder --virtual-sink run
+```
+
+### Bedienung & Verhalten
+
+- **Hörlautstärke regeln / muten**: Stelle im Desktop-Audio-Mixer (`pavucontrol`, GNOME/KDE/Waybar-Mixer) die Lautstärke von **`PipeWire Recorder Playback`** ein (oder schalte ihn komplett stumm). Andere Apps (Browser, Discord, Spiele) bleiben davon völlig unberührt – ebenso EasyEffects und die 100-%-Aufnahme.
+- **Spotify selbst**: Den Spotify-internen Regler auf **100 %** lassen und in Spotify **„Lautstärke anpassen“** deaktivieren (diese beiden Schritte passieren im Spotify-Prozess vor PipeWire).
+- **Kein ungewollter Default-Sink**: Der virtuelle Sink wird mit `priority.session = 0` und `priority.driver = 0` angelegt, sodass er niemals versehentlich das Standard-Ausgabegerät übernimmt.
+- **Sauberes Aufräumen beim Beenden**: Beim Stoppen des Daemons (`Ctrl+C` oder `systemctl --user stop pipewire-recorder`) wird die `target.object`-Zuordnung entfernt und `pw-loopback` beendet, sodass Spotify nahtlos wieder über dein reguläres Standard-Ausgabegerät weiterläuft.
+- **Status prüfen**: Mit `pipewire-recorder status` und `pipewire-recorder list-streams` siehst du den aktiven virtuellen Sink sowie die aktuelle Hörlautstärke des Loopback-Streams.
 
 ---
 
@@ -75,7 +130,7 @@ pipewire-recorder list                 # Alle bereits aufgenommenen Tracks aus d
 pipewire-recorder verify-index         # Nicht mehr vorhandene Dateien aus dem Index bereinigen
 ```
 
-Globale Overrides: `--config <PFAD>`, `--output-dir <DIR>`, `--player <NAME>`, `--pipewire-target <TARGET>`.
+Globale Overrides: `--config <PFAD>`, `--output-dir <DIR>`, `--player <NAME>`, `--pipewire-target <TARGET>`, `--virtual-sink`.
 
 ---
 
@@ -102,6 +157,10 @@ services.pipewire-recorder = {
       mpris_player = "spotify";
       pipewire_target = "spotify";
       enforce_unity_volume = true;
+      virtual_sink = {
+        enabled = true;
+        playback_name = "PipeWire Recorder Playback";
+      };
     };
   };
 };

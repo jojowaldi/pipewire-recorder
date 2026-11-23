@@ -13,7 +13,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 use crate::config::{Config, ConfigFormat};
 use crate::index::RecordedIndex;
 use crate::mpris::{find_active_player_bus, list_mpris_players, query_player_snapshot};
-use crate::pipewire::{find_matching_node, list_audio_output_streams};
+use crate::pipewire::{
+    CAPTURE_SINK_ROLE, find_matching_node, find_sink_by_name, list_audio_output_streams,
+    list_audio_sinks, list_loopback_playback_nodes,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -37,6 +40,10 @@ struct Cli {
     /// Override target PipeWire stream matcher (app name, binary, node.name, or serial)
     #[arg(long, global = true)]
     pipewire_target: Option<String>,
+
+    /// Enable virtual PipeWire capture sink + volume-controllable playback loopback
+    #[arg(long, global = true)]
+    virtual_sink: bool,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -132,6 +139,9 @@ async fn main() -> Result<()> {
     if let Some(pw) = cli.pipewire_target {
         cfg.stream.pipewire_target = pw;
     }
+    if cli.virtual_sink {
+        cfg.stream.virtual_sink.enabled = true;
+    }
 
     match cli.command.unwrap_or(Commands::Run) {
         Commands::Run => recorder::run_daemon(cfg, cfg_path).await,
@@ -197,6 +207,37 @@ async fn cmd_list_streams() -> Result<()> {
         }
     }
 
+    let virtual_sinks: Vec<_> = list_audio_sinks()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| s.recorder_role.as_deref() == Some(CAPTURE_SINK_ROLE))
+        .collect();
+    let loopbacks = list_loopback_playback_nodes().await.unwrap_or_default();
+    if !virtual_sinks.is_empty() || !loopbacks.is_empty() {
+        println!("\n=== Active PipeWire Recorder Virtual Sink / Loopback ===");
+        for sink in virtual_sinks {
+            println!(
+                "  - capture sink  : serial: {:<5} id: {:<4} node: {:<28} desc: \"{}\" vol: {}",
+                sink.serial,
+                sink.id,
+                sink.node_name,
+                sink.description,
+                sink.display_volume()
+            );
+        }
+        for lb in loopbacks {
+            println!(
+                "  - playback mixer: serial: {:<5} id: {:<4} node: {:<28} app: \"{}\" vol: {}",
+                lb.serial,
+                lb.id,
+                lb.node_name,
+                lb.app_name,
+                lb.display_volume()
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -212,6 +253,16 @@ async fn cmd_status(cfg: &Config, cfg_path: &Path) -> Result<()> {
     println!("Target PW stream    : {}", cfg.stream.pipewire_target);
     println!("Trim silence        : {}", cfg.audio.trim_silence);
     println!("Enforce 100% volume : {}", cfg.stream.enforce_unity_volume);
+    if cfg.stream.virtual_sink.enabled {
+        println!(
+            "Virtual sink        : enabled (sink=\"{}\", playback=\"{}\", auto_route={})",
+            cfg.stream.virtual_sink.sink_name,
+            cfg.stream.virtual_sink.playback_name,
+            cfg.stream.virtual_sink.auto_route
+        );
+    } else {
+        println!("Virtual sink        : disabled");
+    }
 
     if let Ok(conn) = zbus::Connection::session().await {
         match find_active_player_bus(&conn, &cfg.stream.mpris_player).await? {
@@ -235,6 +286,34 @@ async fn cmd_status(cfg: &Config, cfg_path: &Path) -> Result<()> {
         }
     } else {
         println!("Matched PW stream   : (pw-dump unavailable)");
+    }
+
+    if cfg.stream.virtual_sink.enabled {
+        match find_sink_by_name(&cfg.stream.virtual_sink.sink_name).await {
+            Ok(Some(sink)) => println!(
+                "Active virtual sink : id={} serial={} node=\"{}\" vol={}",
+                sink.id,
+                sink.serial,
+                sink.node_name,
+                sink.display_volume()
+            ),
+            Ok(None) => println!("Active virtual sink : (not currently active)"),
+            Err(_) => println!("Active virtual sink : (pw-dump unavailable)"),
+        }
+        if let Ok(playbacks) = list_loopback_playback_nodes().await {
+            let expected_node = cfg.stream.virtual_sink.playback_node_name();
+            if let Some(lb) = playbacks.into_iter().find(|n| n.node_name == expected_node) {
+                println!(
+                    "Loopback playback   : id={} serial={} mixer=\"{}\" vol={}",
+                    lb.id,
+                    lb.serial,
+                    lb.app_name,
+                    lb.display_volume()
+                );
+            } else {
+                println!("Loopback playback   : (not currently active)");
+            }
+        }
     }
 
     Ok(())

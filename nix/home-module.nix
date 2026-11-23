@@ -83,6 +83,39 @@ in
               default = true;
               description = "Enforce 1.0 (100%) MPRIS and PipeWire stream volume for bit-exact recording; discard if attenuated.";
             };
+
+            virtual_sink = {
+              enabled = lib.mkOption {
+                type = lib.types.bool;
+                default = false;
+                description = "Spawn a virtual PipeWire capture sink + controllable playback loopback so you can attenuate or mute listening volume independently while capturing 100% bit-exact audio.";
+              };
+              sink_name = lib.mkOption {
+                type = lib.types.str;
+                default = "pipewire_recorder_capture";
+                description = "Internal PipeWire node.name for the virtual capture Audio/Sink.";
+              };
+              sink_description = lib.mkOption {
+                type = lib.types.str;
+                default = "PipeWire Recorder Capture (100%)";
+                description = "Human-readable description for the virtual capture Audio/Sink.";
+              };
+              playback_name = lib.mkOption {
+                type = lib.types.str;
+                default = "PipeWire Recorder Playback";
+                description = "Mixer label of the loopback playback stream where you control listening volume/mute.";
+              };
+              playback_target = lib.mkOption {
+                type = lib.types.nullOr lib.types.str;
+                default = null;
+                description = "Optional PipeWire target sink (node.name or object.serial) for the loopback playback stream (null follows default sink / EasyEffects).";
+              };
+              auto_route = lib.mkOption {
+                type = lib.types.bool;
+                default = true;
+                description = "Automatically route the target app's PipeWire stream to the virtual capture sink via pw-metadata.";
+              };
+            };
           };
 
           completeness = {

@@ -38,6 +38,21 @@ stream:
   #   DEAKTIVIERT sein, damit Spotify vor PipeWire keine Normalisierung einrechnet.
   enforce_unity_volume: true
 
+  # Optional (Variante 1): Virtueller Capture-Sink + regelbarer Loopback-Ausgang
+  # Aktivieren (`enabled: true`), wenn du Spotify (oder den Ziel-Player) unabhängig von anderen Apps
+  # im Desktop-Mixer leiser drehen oder stummschalten möchtest, während trotzdem 1:1 mit 100%
+  # aufgenommen wird. Spotify selbst bleibt dabei auf 100%; die Hörlautstärke regelst du über den
+  # separaten Mixer-Eintrag `playback_name` (z. B. "PipeWire Recorder Playback").
+  virtual_sink:
+    enabled: false
+    sink_name: "pipewire_recorder_capture"
+    sink_description: "PipeWire Recorder Capture (100%)"
+    playback_name: "PipeWire Recorder Playback"
+    # Optionales Ziel für die Hör-Ausgabe (node.name oder object.serial); null = System-Default / EasyEffects
+    playback_target: null
+    # Ziel-Stream (z. B. Spotify) automatisch via pw-metadata auf den virtuellen Sink routen
+    auto_route: true
+
 # Regeln für vollständige Song-Aufnahmen
 completeness:
   max_start_offset_ms: 2500
@@ -80,6 +95,24 @@ pub struct StreamConfig {
     pub sample_rate: u32,
     pub channels: u16,
     pub enforce_unity_volume: bool,
+    pub virtual_sink: VirtualSinkConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct VirtualSinkConfig {
+    pub enabled: bool,
+    pub sink_name: String,
+    pub sink_description: String,
+    pub playback_name: String,
+    pub playback_target: Option<String>,
+    pub auto_route: bool,
+}
+
+impl VirtualSinkConfig {
+    pub fn playback_node_name(&self) -> String {
+        format!("{}.playback", self.sink_name)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -122,6 +155,20 @@ impl Default for StreamConfig {
             sample_rate: 44100,
             channels: 2,
             enforce_unity_volume: true,
+            virtual_sink: VirtualSinkConfig::default(),
+        }
+    }
+}
+
+impl Default for VirtualSinkConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sink_name: "pipewire_recorder_capture".to_string(),
+            sink_description: "PipeWire Recorder Capture (100%)".to_string(),
+            playback_name: "PipeWire Recorder Playback".to_string(),
+            playback_target: None,
+            auto_route: true,
         }
     }
 }
@@ -273,9 +320,34 @@ mod tests {
         let cfg = Config::default();
         assert!(!cfg.audio.trim_silence);
         assert!(cfg.stream.enforce_unity_volume);
+        assert!(!cfg.stream.virtual_sink.enabled);
+        assert!(cfg.stream.virtual_sink.auto_route);
+        assert_eq!(cfg.stream.virtual_sink.sink_name, "pipewire_recorder_capture");
+        assert_eq!(
+            cfg.stream.virtual_sink.playback_node_name(),
+            "pipewire_recorder_capture.playback"
+        );
         assert_eq!(cfg.stream.mpris_player, "spotify");
         assert_eq!(cfg.stream.pipewire_target, "spotify");
         assert_eq!(cfg.output_dir, "~/Music/Spotify");
+    }
+
+    #[test]
+    fn partial_virtual_sink_yaml_populates_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            "stream:\n  virtual_sink:\n    enabled: true\n    playback_name: \"Spotify Lautstärke\"\n",
+        )
+        .unwrap();
+
+        let (cfg, _) = Config::load_or_init_in_dir(dir.path(), None).unwrap();
+        assert!(cfg.stream.virtual_sink.enabled);
+        assert_eq!(cfg.stream.virtual_sink.playback_name, "Spotify Lautstärke");
+        assert_eq!(cfg.stream.virtual_sink.sink_name, "pipewire_recorder_capture");
+        assert!(cfg.stream.virtual_sink.auto_route);
+        assert!(cfg.stream.virtual_sink.playback_target.is_none());
     }
 
     #[test]

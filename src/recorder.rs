@@ -16,7 +16,9 @@ use crate::mpris::{
     resolve_name_owner, set_mpris_volume,
 };
 use crate::pipewire::{
-    PipeWireNode, PwRecorderProcess, PwStreamEvent, enforce_node_unity_volume, find_target_node,
+    PipeWireNode, PipeWireSink, PwLoopbackProcess, PwRecorderProcess, PwStreamEvent,
+    clear_stream_route, enforce_node_unity_volume, find_sink_by_name, find_target_node,
+    route_stream_to_sink, wait_for_virtual_sink,
 };
 use crate::tagger::{CoverArtCache, encode_and_tag_flac, fetch_cover_art};
 
@@ -226,6 +228,7 @@ pub async fn run_daemon(config: Config, config_path: PathBuf) -> Result<()> {
         pipewire_target = %config.stream.pipewire_target,
         trim_silence = config.audio.trim_silence,
         enforce_unity_volume = config.stream.enforce_unity_volume,
+        virtual_sink_enabled = config.stream.virtual_sink.enabled,
         "Started pipewire-recorder daemon"
     );
 
@@ -252,7 +255,27 @@ pub async fn run_daemon(config: Config, config_path: PathBuf) -> Result<()> {
     let mut active_pw: Option<(PwRecorderProcess, tokio::sync::mpsc::Receiver<PwStreamEvent>)> =
         None;
     let mut current_pw_node: Option<PipeWireNode> = None;
+    let mut active_loopback: Option<PwLoopbackProcess> = None;
+    let mut active_virtual_sink: Option<PipeWireSink> = None;
+    let mut routed_stream: Option<(u32, u32)> = None;
     let mut paused_since: Option<Instant> = None;
+
+    if config.stream.virtual_sink.enabled {
+        ensure_virtual_sink_running(
+            &config,
+            &mut active_loopback,
+            &mut active_virtual_sink,
+            &mut routed_stream,
+        )
+        .await;
+
+        if config.stream.virtual_sink.auto_route
+            && let Ok(Some(node)) = find_target_node(&config.stream.pipewire_target).await
+        {
+            maybe_route_target_stream(&config, &node, &active_virtual_sink, &mut routed_stream)
+                .await;
+        }
+    }
 
     if let Some(ref bus) = active_bus {
         info!(bus_name = %bus, "Found target MPRIS player");
@@ -276,17 +299,43 @@ pub async fn run_daemon(config: Config, config_path: PathBuf) -> Result<()> {
         );
     }
 
+    let shutdown = async {
+        let ctrl_c = tokio::signal::ctrl_c();
+        #[cfg(unix)]
+        {
+            if let Ok(mut term) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            {
+                tokio::select! {
+                    _ = ctrl_c => {}
+                    _ = term.recv() => {}
+                }
+                return;
+            }
+        }
+        let _ = ctrl_c.await;
+    };
+    tokio::pin!(shutdown);
+
     let mut tick = tokio::time::interval(Duration::from_secs(1));
 
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
+            _ = &mut shutdown => {
                 info!("Received shutdown signal; stopping recorder");
                 if let Some((pw, _)) = active_pw.take() {
                     pw.stop().await;
                 }
                 if let Some(session) = active_session.take() {
                     maybe_finalize_session(session, &config, &index, &index_path, &art_cache).await;
+                }
+                if let Some((node_id, _)) = routed_stream.take()
+                    && let Err(err) = clear_stream_route(node_id).await
+                {
+                    debug!(node_id, error = %err, "Failed clearing target.object route on shutdown");
+                }
+                if let Some(lb) = active_loopback.take() {
+                    lb.stop().await;
                 }
                 break;
             }
@@ -409,6 +458,7 @@ pub async fn run_daemon(config: Config, config_path: PathBuf) -> Result<()> {
                                     pw.stop().await;
                                 }
                                 current_pw_node = None;
+                                routed_stream = None;
                             }
                         }
                     }
@@ -474,62 +524,90 @@ pub async fn run_daemon(config: Config, config_path: PathBuf) -> Result<()> {
                     }
                 }
 
-                // Manage PipeWire capture lifecycle and node volume monitoring
+                // Keep virtual capture sink + playback loopback alive when enabled
+                if config.stream.virtual_sink.enabled {
+                    ensure_virtual_sink_running(
+                        &config,
+                        &mut active_loopback,
+                        &mut active_virtual_sink,
+                        &mut routed_stream,
+                    )
+                    .await;
+                }
+
+                // Manage PipeWire capture lifecycle, virtual-sink routing, and node volume monitoring
                 let should_capture = active_session
                     .as_ref()
                     .is_some_and(|s| !s.skip_buffering && paused_since.is_none());
+                let should_poll_node = should_capture
+                    || (config.stream.virtual_sink.enabled && config.stream.virtual_sink.auto_route);
 
-                if should_capture {
+                if should_poll_node {
                     match find_target_node(&config.stream.pipewire_target).await {
                         Ok(Some(node)) => {
-                            if config.stream.enforce_unity_volume && !node.is_unity_volume() {
-                                if active_pw.is_some() {
-                                    if let Some(ref mut session) = active_session {
-                                        warn!(
-                                            title = %session.meta.title,
-                                            node_volume = %node.display_volume(),
-                                            "Invalidating take: PipeWire stream volume attenuated/muted"
-                                        );
-                                        session.invalidate(InvalidationReason::VolumeAttenuated);
-                                    }
-                                } else if let Err(err) = enforce_node_unity_volume(&node).await {
-                                    warn!("Failed setting unity volume on PipeWire node: {}", err);
-                                }
+                            if config.stream.virtual_sink.enabled
+                                && config.stream.virtual_sink.auto_route
+                            {
+                                maybe_route_target_stream(
+                                    &config,
+                                    &node,
+                                    &active_virtual_sink,
+                                    &mut routed_stream,
+                                )
+                                .await;
                             }
 
-                            let needs_respawn = active_pw
-                                .as_ref()
-                                .is_none_or(|(pw, _)| pw.target_serial != node.serial);
-
-                            if needs_respawn {
-                                if let Some((old_pw, _)) = active_pw.take() {
-                                    old_pw.stop().await;
-                                }
+                            if should_capture {
                                 if config.stream.enforce_unity_volume && !node.is_unity_volume() {
-                                    let _ = enforce_node_unity_volume(&node).await;
-                                }
-                                match PwRecorderProcess::spawn(
-                                    &node,
-                                    config.stream.sample_rate,
-                                    config.stream.channels,
-                                ).await {
-                                    Ok((pw, rx)) => {
-                                        info!(
-                                            node_id = node.id,
-                                            serial = node.serial,
-                                            app = %node.app_name,
-                                            "Attached pw-record to PipeWire stream"
-                                        );
-                                        active_pw = Some((pw, rx));
-                                        current_pw_node = Some(node);
+                                    if active_pw.is_some() {
+                                        if let Some(ref mut session) = active_session {
+                                            warn!(
+                                                title = %session.meta.title,
+                                                node_volume = %node.display_volume(),
+                                                "Invalidating take: PipeWire stream volume attenuated/muted"
+                                            );
+                                            session.invalidate(InvalidationReason::VolumeAttenuated);
+                                        }
+                                    } else if let Err(err) = enforce_node_unity_volume(&node).await {
+                                        warn!("Failed setting unity volume on PipeWire node: {}", err);
                                     }
-                                    Err(err) => {
-                                        error!("Failed to spawn pw-record: {}", err);
+                                }
+
+                                let needs_respawn = active_pw
+                                    .as_ref()
+                                    .is_none_or(|(pw, _)| pw.target_serial != node.serial);
+
+                                if needs_respawn {
+                                    if let Some((old_pw, _)) = active_pw.take() {
+                                        old_pw.stop().await;
+                                    }
+                                    if config.stream.enforce_unity_volume && !node.is_unity_volume() {
+                                        let _ = enforce_node_unity_volume(&node).await;
+                                    }
+                                    match PwRecorderProcess::spawn(
+                                        &node,
+                                        config.stream.sample_rate,
+                                        config.stream.channels,
+                                    ).await {
+                                        Ok((pw, rx)) => {
+                                            info!(
+                                                node_id = node.id,
+                                                serial = node.serial,
+                                                app = %node.app_name,
+                                                "Attached pw-record to PipeWire stream"
+                                            );
+                                            active_pw = Some((pw, rx));
+                                            current_pw_node = Some(node);
+                                        }
+                                        Err(err) => {
+                                            error!("Failed to spawn pw-record: {}", err);
+                                        }
                                     }
                                 }
                             }
                         }
                         Ok(None) => {
+                            routed_stream = None;
                             if current_pw_node.is_some() {
                                 debug!(
                                     target = %config.stream.pipewire_target,
@@ -541,7 +619,10 @@ pub async fn run_daemon(config: Config, config_path: PathBuf) -> Result<()> {
                             warn!("pw-dump lookup error: {}", err);
                         }
                     }
-                } else if let Some(since) = paused_since
+                }
+
+                if !should_capture
+                    && let Some(since) = paused_since
                     && since.elapsed() >= Duration::from_secs(config.audio.idle_timeout_secs)
                     && let Some((pw, _)) = active_pw.take()
                 {
@@ -554,6 +635,117 @@ pub async fn run_daemon(config: Config, config_path: PathBuf) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn ensure_virtual_sink_running(
+    config: &Config,
+    active_loopback: &mut Option<PwLoopbackProcess>,
+    active_virtual_sink: &mut Option<PipeWireSink>,
+    routed_stream: &mut Option<(u32, u32)>,
+) {
+    if !config.stream.virtual_sink.enabled {
+        return;
+    }
+
+    let needs_spawn = match active_loopback.as_mut() {
+        Some(lb) => !lb.is_alive(),
+        None => true,
+    };
+
+    if !needs_spawn {
+        if active_virtual_sink.is_none()
+            && let Ok(Some(sink)) = find_sink_by_name(&config.stream.virtual_sink.sink_name).await
+        {
+            *active_virtual_sink = Some(sink);
+        }
+        return;
+    }
+
+    if let Some(old_lb) = active_loopback.take() {
+        warn!(
+            sink_name = %old_lb.sink_name,
+            "pw-loopback virtual sink exited unexpectedly; respawning"
+        );
+        old_lb.stop().await;
+    }
+    *active_virtual_sink = None;
+    *routed_stream = None;
+
+    match PwLoopbackProcess::spawn(
+        &config.stream.virtual_sink,
+        config.stream.sample_rate,
+        config.stream.channels,
+    )
+    .await
+    {
+        Ok(lb) => {
+            let sink = wait_for_virtual_sink(
+                &config.stream.virtual_sink.sink_name,
+                Duration::from_secs(2),
+            )
+            .await;
+            match sink {
+                Some(ref s) => {
+                    info!(
+                        sink_id = s.id,
+                        sink_serial = s.serial,
+                        sink_name = %s.node_name,
+                        playback_mixer = %config.stream.virtual_sink.playback_name,
+                        "Started virtual capture sink + controllable playback loopback"
+                    );
+                }
+                None => {
+                    warn!(
+                        sink_name = %config.stream.virtual_sink.sink_name,
+                        "Spawned pw-loopback, but virtual sink not yet visible in pw-dump"
+                    );
+                }
+            }
+            *active_virtual_sink = sink;
+            *active_loopback = Some(lb);
+        }
+        Err(err) => {
+            error!("Failed to spawn pw-loopback virtual sink: {}", err);
+        }
+    }
+}
+
+async fn maybe_route_target_stream(
+    config: &Config,
+    node: &PipeWireNode,
+    active_virtual_sink: &Option<PipeWireSink>,
+    routed_stream: &mut Option<(u32, u32)>,
+) {
+    if *routed_stream == Some((node.id, node.serial)) {
+        return;
+    }
+
+    let target = active_virtual_sink
+        .as_ref()
+        .map(|s| s.serial.to_string())
+        .unwrap_or_else(|| config.stream.virtual_sink.sink_name.clone());
+
+    match route_stream_to_sink(node.id, &target).await {
+        Ok(()) => {
+            info!(
+                node_id = node.id,
+                serial = node.serial,
+                app = %node.app_name,
+                sink = %config.stream.virtual_sink.sink_name,
+                playback_mixer = %config.stream.virtual_sink.playback_name,
+                "Routed target stream to virtual capture sink (adjust listening volume via playback loopback)"
+            );
+            *routed_stream = Some((node.id, node.serial));
+        }
+        Err(err) => {
+            warn!(
+                node_id = node.id,
+                sink = %config.stream.virtual_sink.sink_name,
+                error = %err,
+                "Failed routing target stream to virtual capture sink"
+            );
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

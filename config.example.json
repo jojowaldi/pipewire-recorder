@@ -7,7 +7,15 @@
     "pipewire_target": "spotify",
     "sample_rate": 44100,
     "channels": 2,
-    "enforce_unity_volume": true
+    "enforce_unity_volume": true,
+    "virtual_sink": {
+      "enabled": false,
+      "sink_name": "pipewire_recorder_capture",
+      "sink_description": "PipeWire Recorder Capture (100%)",
+      "playback_name": "PipeWire Recorder Playback",
+      "playback_target": null,
+      "auto_route": true
+    }
   },
   "completeness": {
     "max_start_offset_ms": 2500,
