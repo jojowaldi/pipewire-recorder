@@ -1,0 +1,50 @@
+# ~/.config/pipewire-recorder/config.yaml
+#
+# Standardkonfiguration für pipewire-recorder.
+# Alle Felder sind optional; nicht gesetzte Werte verwenden die eingebauten Standards.
+# Alternativ kann stattdessen eine `config.json` im selben Verzeichnis verwendet werden.
+
+# Speicherort und Dateibenennung
+output_dir: "~/Music/Spotify"
+path_template: "{artist}/{album}/{track_number} - {title}.flac"
+index_path: "~/.local/share/pipewire-recorder/recorded_index.json"
+
+# Ziel-Player & PipeWire-Output-Stream
+stream:
+  # MPRIS-Player-Name auf dem Session-D-Bus (z. B. "spotify", "firefox", "vlc", "amberol", "mpd")
+  # Unterstützt auch Instanz-Suffixe wie org.mpris.MediaPlayer2.firefox.instance_1_23
+  mpris_player: "spotify"
+
+  # PipeWire-Stream-Matcher gegen application.name, application.process.binary, node.name,
+  # media.name oder numerische object.serial / node.id (aus `pipewire-recorder list-streams`)
+  pipewire_target: "spotify"
+
+  # Aufnahmeformat (1:1 PipeWire PCM ohne Resampling-Effekte)
+  sample_rate: 44100
+  channels: 2
+
+  # WICHTIG (1:1 Signal / Lautstärke-Verhalten):
+  # - System-/Master-Lautstärke & EasyEffects wirken erst am Sink hinter dem Stream und
+  #   beeinflussen die Aufnahme NICHT.
+  # - App-Lautstärke (Per-App-Mixer `channelVolumes` / Spotify-Slider / MPRIS Volume) wirkt
+  #   jedoch direkt auf den Stream. Mit `enforce_unity_volume: true` setzt der Daemon beim
+  #   Start 1.0 (100%) und verwirft die Aufnahme, falls während des Songs leiser gedreht/gemutet wird.
+  # - In Spotify selbst sollte "Einstellungen -> Audioqualität -> Lautstärke anpassen"
+  #   DEAKTIVIERT sein, damit Spotify vor PipeWire keine Normalisierung einrechnet.
+  enforce_unity_volume: true
+
+# Regeln für vollständige Song-Aufnahmen
+completeness:
+  max_start_offset_ms: 2500
+  duration_tolerance_ms: 3000
+  min_completion_ratio: 0.97
+  allow_pause: false
+
+# Audio-Verarbeitung & Prozess-Lifecycle
+audio:
+  flac_compression_level: 5
+  # Standardmäßig false, damit der Stream 1:1 unverändert (bit-exakt) gespeichert wird.
+  trim_silence: false
+  silence_threshold_db: -60.0
+  max_trim_ms: 1500
+  idle_timeout_secs: 15

@@ -1,0 +1,25 @@
+{
+  "output_dir": "~/Music/Spotify",
+  "path_template": "{artist}/{album}/{track_number} - {title}.flac",
+  "index_path": "~/.local/share/pipewire-recorder/recorded_index.json",
+  "stream": {
+    "mpris_player": "spotify",
+    "pipewire_target": "spotify",
+    "sample_rate": 44100,
+    "channels": 2,
+    "enforce_unity_volume": true
+  },
+  "completeness": {
+    "max_start_offset_ms": 2500,
+    "duration_tolerance_ms": 3000,
+    "min_completion_ratio": 0.97,
+    "allow_pause": false
+  },
+  "audio": {
+    "flac_compression_level": 5,
+    "trim_silence": false,
+    "silence_threshold_db": -60.0,
+    "max_trim_ms": 1500,
+    "idle_timeout_secs": 15
+  }
+}
