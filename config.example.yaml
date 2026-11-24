@@ -1,64 +1,64 @@
 # ~/.config/pipewire-recorder/config.yaml
 #
-# Standardkonfiguration für pipewire-recorder.
-# Alle Felder sind optional; nicht gesetzte Werte verwenden die eingebauten Standards.
-# Alternativ kann stattdessen eine `config.json` im selben Verzeichnis verwendet werden.
+# Default configuration for pipewire-recorder.
+# All fields are optional; unset values fall back to built-in defaults.
+# Alternatively, you can place a `config.json` in the same directory.
 
-# Speicherort und Dateibenennung
+# Output location and file naming
 output_dir: "~/Music/Spotify"
 path_template: "{artist}/{album}/{track_number} - {title}.flac"
 index_path: "~/.local/share/pipewire-recorder/recorded_index.json"
 
-# Ziel-Player & PipeWire-Output-Stream
+# Target media player & PipeWire output stream
 stream:
-  # MPRIS-Player-Name auf dem Session-D-Bus (z. B. "spotify", "firefox", "vlc", "amberol", "mpd")
-  # Unterstützt auch Instanz-Suffixe wie org.mpris.MediaPlayer2.firefox.instance_1_23
+  # MPRIS2 player name on the session D-Bus (e.g. "spotify", "firefox", "vlc", "amberol", "mpd")
+  # Also matches instance suffixes such as org.mpris.MediaPlayer2.firefox.instance_1_23
   mpris_player: "spotify"
 
-  # PipeWire-Stream-Matcher gegen application.name, application.process.binary, node.name,
-  # media.name oder numerische object.serial / node.id (aus `pipewire-recorder list-streams`)
+  # PipeWire stream matcher checked against application.name, application.process.binary,
+  # node.name, media.name, or numeric object.serial / node.id (see `pipewire-recorder list-streams`)
   pipewire_target: "spotify"
 
-  # Aufnahmeformat (1:1 PipeWire PCM ohne Resampling-Effekte)
+  # Capture PCM format (1:1 PipeWire PCM without resampling effects)
   sample_rate: 44100
   channels: 2
 
-  # WICHTIG (1:1 Signal / Lautstärke-Verhalten):
-  # - System-/Master-Lautstärke & EasyEffects wirken erst am Sink hinter dem Stream und
-  #   beeinflussen die Aufnahme NICHT.
-  # - App-Lautstärke (Per-App-Mixer `channelVolumes` / Spotify-Slider / MPRIS Volume) wirkt
-  #   jedoch direkt auf den Stream. Mit `enforce_unity_volume: true` setzt der Daemon beim
-  #   Start 1.0 (100%) und verwirft die Aufnahme, falls während des Songs leiser gedreht/gemutet wird.
-  # - In Spotify selbst sollte "Einstellungen -> Audioqualität -> Lautstärke anpassen"
-  #   DEAKTIVIERT sein, damit Spotify vor PipeWire keine Normalisierung einrechnet.
+  # IMPORTANT (1:1 signal / volume behavior & EasyEffects):
+  # - System/master sink volume and EasyEffects act downstream of the app stream and do NOT
+  #   affect the recording.
+  # - Per-app stream volume (`channelVolumes` / Spotify volume slider / MPRIS Volume) scales
+  #   samples directly on the stream. With `enforce_unity_volume: true`, the daemon resets
+  #   volume to 1.0 (100%) on track start and discards takes if attenuated or muted mid-track.
+  # - In Spotify itself, disable "Settings -> Audio Quality -> Normalize volume" so Spotify
+  #   does not apply internal ReplayGain scaling before PipeWire receives the audio.
   enforce_unity_volume: true
 
-  # Optional: Virtueller Capture-Sink + regelbarer Loopback-Ausgang
-  # Aktivieren (`enabled: true`), um Spotify (oder den Ziel-Player) im Desktop-Mixer unabhängig
-  # von anderen Apps leiser zu drehen oder stummzuschalten, während trotzdem 1:1 mit 100%
-  # aufgenommen wird. Spotify bleibt auf 100%; die Hörlautstärke wird über den separaten
-  # Mixer-Stream `playback_name` (z. B. "PipeWire Recorder Playback") geregelt.
+  # Optional: Virtual capture sink + independently controllable playback loopback
+  # Set `enabled: true` to lower or mute Spotify (or the target player) in your desktop mixer
+  # independently of other apps while still recording bit-exact audio at 100%.
+  # Keep the player itself at 100% and control listening volume via `playback_name`
+  # (e.g. "PipeWire Recorder Playback").
   virtual_sink:
     enabled: false
     sink_name: "pipewire_recorder_capture"
     sink_description: "PipeWire Recorder Capture (100%)"
     playback_name: "PipeWire Recorder Playback"
-    # Optionales Ziel für die Hör-Ausgabe (node.name oder object.serial); null = System-Default / EasyEffects
+    # Optional target sink for listening playback (node.name or object.serial); null = system default / EasyEffects
     playback_target: null
-    # Ziel-Stream automatisch via pw-metadata auf den virtuellen Sink routen
+    # Automatically route the target stream to the virtual sink via pw-metadata
     auto_route: true
 
-# Regeln für vollständige Song-Aufnahmen
+# Completeness validation rules for saving tracks
 completeness:
   max_start_offset_ms: 2500
   duration_tolerance_ms: 3000
   min_completion_ratio: 0.97
   allow_pause: false
 
-# Audio-Verarbeitung & Prozess-Lifecycle
+# Audio encoding & capture process lifecycle
 audio:
   flac_compression_level: 5
-  # Standardmäßig false, damit der Stream 1:1 unverändert (bit-exakt) gespeichert wird.
+  # Defaults to false so captured PCM frames are stored 1:1 unmodified (bit-exact).
   trim_silence: false
   silence_threshold_db: -60.0
   max_trim_ms: 1500
