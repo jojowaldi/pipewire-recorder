@@ -411,7 +411,10 @@ pub async fn clear_stream_route(node_id: u32) -> Result<()> {
         );
     }
 
-    debug!(node_id, "Cleared PipeWire target.object metadata for stream");
+    debug!(
+        node_id,
+        "Cleared PipeWire target.object metadata for stream"
+    );
     Ok(())
 }
 
@@ -488,11 +491,7 @@ pub struct PwLoopbackProcess {
 }
 
 impl PwLoopbackProcess {
-    pub async fn spawn(
-        cfg: &VirtualSinkConfig,
-        sample_rate: u32,
-        channels: u16,
-    ) -> Result<Self> {
+    pub async fn spawn(cfg: &VirtualSinkConfig, sample_rate: u32, channels: u16) -> Result<Self> {
         let channels_arg = channels.to_string();
         let (capture_props, playback_props) = build_loopback_props(cfg, sample_rate, channels);
 
@@ -563,7 +562,10 @@ pub async fn enforce_node_unity_volume(node: &PipeWireNode) -> Result<()> {
         && m.status.success()
         && v.status.success()
     {
-        debug!(node_id = node.id, "Set PipeWire stream volume to 100% via wpctl");
+        debug!(
+            node_id = node.id,
+            "Set PipeWire stream volume to 100% via wpctl"
+        );
         return Ok(());
     }
 
@@ -579,7 +581,11 @@ pub async fn enforce_node_unity_volume(node: &PipeWireNode) -> Result<()> {
 
     if !pw_cli_out.status.success() {
         let stderr = String::from_utf8_lossy(&pw_cli_out.stderr);
-        anyhow::bail!("failed to enforce unity volume on PipeWire node {}: {}", node.id, stderr.trim());
+        anyhow::bail!(
+            "failed to enforce unity volume on PipeWire node {}: {}",
+            node.id,
+            stderr.trim()
+        );
     }
 
     Ok(())
@@ -682,7 +688,9 @@ impl PwRecorderProcess {
                             leftover = Some(b);
                         }
 
-                        if !samples.is_empty() && tx.send(PwStreamEvent::Samples(samples)).await.is_err() {
+                        if !samples.is_empty()
+                            && tx.send(PwStreamEvent::Samples(samples)).await.is_err()
+                        {
                             break;
                         }
                     }

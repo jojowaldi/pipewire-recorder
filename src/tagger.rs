@@ -239,7 +239,11 @@ async fn write_temp_flac_and_tags(
     let flac_out = child.wait_with_output().await?;
     if !flac_out.status.success() {
         let stderr = String::from_utf8_lossy(&flac_out.stderr);
-        anyhow::bail!("flac encoding failed ({}): {}", flac_out.status, stderr.trim());
+        anyhow::bail!(
+            "flac encoding failed ({}): {}",
+            flac_out.status,
+            stderr.trim()
+        );
     }
 
     let mut tag_args: Vec<String> = vec!["--remove-all-tags".to_string()];

@@ -1,5 +1,6 @@
 mod config;
 mod index;
+mod ipc;
 mod mpris;
 mod pipewire;
 mod recorder;
@@ -41,9 +42,13 @@ struct Cli {
     #[arg(long, global = true)]
     pipewire_target: Option<String>,
 
-    /// Enable virtual PipeWire capture sink + volume-controllable playback loopback
-    #[arg(long, global = true)]
-    virtual_sink: bool,
+    /// Override virtual PipeWire capture sink + playback loopback (`--virtual-sink` or `--virtual-sink=false`)
+    #[arg(long, global = true, num_args = 0..=1, default_missing_value = "true")]
+    virtual_sink: Option<bool>,
+
+    /// Override 100% unity volume enforcement (`--enforce-unity-volume=true|false`)
+    #[arg(long, global = true, num_args = 0..=1, default_missing_value = "true")]
+    enforce_unity_volume: Option<bool>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -58,7 +63,14 @@ enum CliConfigFormat {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Start the background recorder daemon (default)
-    Run,
+    Run {
+        /// Enable NDJSON IPC protocol on stdout/stdin (logs go to stderr)
+        #[arg(long)]
+        ipc: bool,
+        /// Start with recording paused (can be enabled later via IPC)
+        #[arg(long)]
+        paused: bool,
+    },
     /// List active MPRIS players and PipeWire Stream/Output/Audio nodes
     ListStreams,
     /// Write a default configuration file to ~/.config/pipewire-recorder/
@@ -94,12 +106,17 @@ async fn main() -> Result<()> {
         "error" => tracing::Level::ERROR,
         _ => tracing::Level::INFO,
     };
-    tracing_subscriber::fmt()
-        .with_max_level(max_level)
-        .with_target(false)
-        .init();
-
     let cli = Cli::parse();
+
+    let is_ipc = matches!(cli.command, Some(Commands::Run { ipc: true, .. }));
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(max_level)
+        .with_target(false);
+    if is_ipc {
+        subscriber.with_writer(std::io::stderr).init();
+    } else {
+        subscriber.init();
+    }
 
     match &cli.command {
         Some(Commands::InitConfig {
@@ -139,12 +156,21 @@ async fn main() -> Result<()> {
     if let Some(pw) = cli.pipewire_target {
         cfg.stream.pipewire_target = pw;
     }
-    if cli.virtual_sink {
-        cfg.stream.virtual_sink.enabled = true;
+    if let Some(vs) = cli.virtual_sink {
+        cfg.stream.virtual_sink.enabled = vs;
+    }
+    if let Some(unity) = cli.enforce_unity_volume {
+        cfg.stream.enforce_unity_volume = unity;
     }
 
-    match cli.command.unwrap_or(Commands::Run) {
-        Commands::Run => recorder::run_daemon(cfg, cfg_path).await,
+    match cli.command.unwrap_or(Commands::Run {
+        ipc: false,
+        paused: false,
+    }) {
+        Commands::Run { ipc: true, paused } => {
+            recorder::run_daemon_ipc(cfg, cfg_path, !paused).await
+        }
+        Commands::Run { ipc: false, .. } => recorder::run_daemon(cfg, cfg_path).await,
         Commands::ListStreams | Commands::InitConfig { .. } => unreachable!(),
         Commands::Status => cmd_status(&cfg, &cfg_path).await,
         Commands::List => cmd_list(&cfg),
@@ -246,9 +272,16 @@ async fn cmd_status(cfg: &Config, cfg_path: &Path) -> Result<()> {
     let index = RecordedIndex::load(&index_path)?;
 
     println!("Config path         : {}", cfg_path.display());
-    println!("Output directory    : {}", cfg.resolved_output_dir().display());
+    println!(
+        "Output directory    : {}",
+        cfg.resolved_output_dir().display()
+    );
     println!("Path template       : {}", cfg.path_template);
-    println!("Index path          : {} ({} tracks)", index_path.display(), index.entries.len());
+    println!(
+        "Index path          : {} ({} tracks)",
+        index_path.display(),
+        index.entries.len()
+    );
     println!("Target MPRIS player : {}", cfg.stream.mpris_player);
     println!("Target PW stream    : {}", cfg.stream.pipewire_target);
     println!("Trim silence        : {}", cfg.audio.trim_silence);

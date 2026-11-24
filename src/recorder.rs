@@ -11,14 +11,18 @@ use zbus::{Connection, MatchRule, MessageStream};
 
 use crate::config::Config;
 use crate::index::{RecordedIndex, render_track_path};
+use crate::ipc::{
+    IpcCommand, IpcEmitter, IpcEvent, IpcMprisPlayerInfo, IpcNodeState, IpcPlaybackStatus,
+    IpcPlayerState, IpcRecordedEntry, IpcTrackState, IpcVirtualSinkState, spawn_ipc_io,
+};
 use crate::mpris::{
-    PlaybackStatus, PlayerSnapshot, TrackMetadata, find_active_player_bus, query_player_snapshot,
-    resolve_name_owner, set_mpris_volume,
+    PlaybackStatus, PlayerSnapshot, TrackMetadata, find_active_player_bus, list_mpris_players,
+    query_player_snapshot, resolve_name_owner, set_mpris_volume,
 };
 use crate::pipewire::{
     PipeWireNode, PipeWireSink, PwLoopbackProcess, PwRecorderProcess, PwStreamEvent,
     clear_stream_route, enforce_node_unity_volume, find_sink_by_name, find_target_node,
-    route_stream_to_sink, wait_for_virtual_sink,
+    list_audio_output_streams, route_stream_to_sink, wait_for_virtual_sink,
 };
 use crate::tagger::{CoverArtCache, encode_and_tag_flac, fetch_cover_art};
 
@@ -55,11 +59,7 @@ impl std::fmt::Display for InvalidationReason {
             Self::TooShort {
                 captured_ms,
                 expected_ms,
-            } => write!(
-                f,
-                "captured {}ms < expected {}ms",
-                captured_ms, expected_ms
-            ),
+            } => write!(f, "captured {}ms < expected {}ms", captured_ms, expected_ms),
             Self::MissingMetadata => write!(f, "missing track title or length metadata"),
         }
     }
@@ -215,6 +215,90 @@ fn same_track(a: &TrackMetadata, b: &TrackMetadata) -> bool {
 }
 
 pub async fn run_daemon(config: Config, config_path: PathBuf) -> Result<()> {
+    run_daemon_inner(config, config_path, None, None, true).await
+}
+
+pub async fn run_daemon_ipc(
+    config: Config,
+    config_path: PathBuf,
+    start_enabled: bool,
+) -> Result<()> {
+    let (emitter, cmd_rx) = spawn_ipc_io();
+    run_daemon_inner(
+        config,
+        config_path,
+        Some(emitter),
+        Some(cmd_rx),
+        start_enabled,
+    )
+    .await
+}
+
+async fn emit_recent_tracks(emitter: &IpcEmitter, index: &Arc<Mutex<RecordedIndex>>, limit: usize) {
+    let guard = index.lock().await;
+    let total = guard.entries.len();
+    let mut sorted: Vec<_> = guard.entries.iter().collect();
+    sorted.sort_by_key(|a| std::cmp::Reverse(a.recorded_at_unix));
+    let entries = sorted
+        .into_iter()
+        .take(limit)
+        .map(IpcRecordedEntry::from)
+        .collect();
+    emitter.emit(IpcEvent::RecentTracks { entries, total });
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn emit_snapshot_if_changed(
+    emitter: Option<&IpcEmitter>,
+    last_emitted: &mut Option<IpcEvent>,
+    config: &Config,
+    recording_enabled: bool,
+    capturing: bool,
+    last_player: Option<&PlayerSnapshot>,
+    current_pw_node: Option<&PipeWireNode>,
+    active_virtual_sink: Option<&PipeWireSink>,
+    routed_stream: Option<(u32, u32)>,
+    active_session: Option<&RecordingSession>,
+    paused_since: Option<Instant>,
+    index: &Arc<Mutex<RecordedIndex>>,
+) {
+    let Some(emitter) = emitter else { return };
+    let index_count = index.lock().await.entries.len();
+    let event = IpcEvent::Snapshot {
+        recording_enabled,
+        capturing,
+        output_dir: config.resolved_output_dir().to_string_lossy().to_string(),
+        mpris_player: config.stream.mpris_player.clone(),
+        pipewire_target: config.stream.pipewire_target.clone(),
+        enforce_unity_volume: config.stream.enforce_unity_volume,
+        player: last_player.map(IpcPlayerState::from),
+        pw_node: current_pw_node.map(IpcNodeState::from),
+        virtual_sink: IpcVirtualSinkState {
+            enabled: config.stream.virtual_sink.enabled,
+            active: active_virtual_sink.is_some(),
+            sink_name: config.stream.virtual_sink.sink_name.clone(),
+            playback_name: config.stream.virtual_sink.playback_name.clone(),
+            playback_node_name: config.stream.virtual_sink.playback_node_name(),
+            routed: routed_stream.is_some(),
+        },
+        track: active_session
+            .map(|s| IpcTrackState::from_session(s, recording_enabled, paused_since.is_some())),
+        index_count,
+    };
+
+    if last_emitted.as_ref() != Some(&event) {
+        emitter.emit(event.clone());
+        *last_emitted = Some(event);
+    }
+}
+
+async fn run_daemon_inner(
+    mut config: Config,
+    config_path: PathBuf,
+    emitter: Option<IpcEmitter>,
+    mut cmd_rx: Option<tokio::sync::mpsc::UnboundedReceiver<IpcCommand>>,
+    mut recording_enabled: bool,
+) -> Result<()> {
     let conn = Connection::session().await?;
     let index_path = config.resolved_index_path();
     let initial_index = RecordedIndex::load(&index_path)?;
@@ -229,6 +313,7 @@ pub async fn run_daemon(config: Config, config_path: PathBuf) -> Result<()> {
         trim_silence = config.audio.trim_silence,
         enforce_unity_volume = config.stream.enforce_unity_volume,
         virtual_sink_enabled = config.stream.virtual_sink.enabled,
+        recording_enabled,
         "Started pipewire-recorder daemon"
     );
 
@@ -251,14 +336,18 @@ pub async fn run_daemon(config: Config, config_path: PathBuf) -> Result<()> {
         Some(bus) => resolve_name_owner(&conn, bus).await.ok(),
         None => None,
     };
+    let mut last_player: Option<PlayerSnapshot> = None;
     let mut active_session: Option<RecordingSession> = None;
-    let mut active_pw: Option<(PwRecorderProcess, tokio::sync::mpsc::Receiver<PwStreamEvent>)> =
-        None;
+    let mut active_pw: Option<(
+        PwRecorderProcess,
+        tokio::sync::mpsc::Receiver<PwStreamEvent>,
+    )> = None;
     let mut current_pw_node: Option<PipeWireNode> = None;
     let mut active_loopback: Option<PwLoopbackProcess> = None;
     let mut active_virtual_sink: Option<PipeWireSink> = None;
     let mut routed_stream: Option<(u32, u32)> = None;
     let mut paused_since: Option<Instant> = None;
+    let mut last_emitted: Option<IpcEvent> = None;
 
     if config.stream.virtual_sink.enabled {
         ensure_virtual_sink_running(
@@ -274,18 +363,22 @@ pub async fn run_daemon(config: Config, config_path: PathBuf) -> Result<()> {
         {
             maybe_route_target_stream(&config, &node, &active_virtual_sink, &mut routed_stream)
                 .await;
+            current_pw_node = Some(node);
         }
     }
 
     if let Some(ref bus) = active_bus {
         info!(bus_name = %bus, "Found target MPRIS player");
         if let Ok(snap) = query_player_snapshot(&conn, bus).await {
+            last_player = Some(snap.clone());
             handle_snapshot(
                 &conn,
                 &config,
+                recording_enabled,
                 &index,
                 &index_path,
                 &art_cache,
+                emitter.as_ref(),
                 snap,
                 &mut active_session,
                 &mut paused_since,
@@ -298,6 +391,25 @@ pub async fn run_daemon(config: Config, config_path: PathBuf) -> Result<()> {
             "Waiting for MPRIS player to appear on D-Bus"
         );
     }
+
+    if let Some(ref em) = emitter {
+        emit_recent_tracks(em, &index, 15).await;
+    }
+    emit_snapshot_if_changed(
+        emitter.as_ref(),
+        &mut last_emitted,
+        &config,
+        recording_enabled,
+        active_pw.is_some(),
+        last_player.as_ref(),
+        current_pw_node.as_ref(),
+        active_virtual_sink.as_ref(),
+        routed_stream,
+        active_session.as_ref(),
+        paused_since,
+        &index,
+    )
+    .await;
 
     let shutdown = async {
         let ctrl_c = tokio::signal::ctrl_c();
@@ -327,7 +439,15 @@ pub async fn run_daemon(config: Config, config_path: PathBuf) -> Result<()> {
                     pw.stop().await;
                 }
                 if let Some(session) = active_session.take() {
-                    maybe_finalize_session(session, &config, &index, &index_path, &art_cache).await;
+                    maybe_finalize_session(
+                        session,
+                        &config,
+                        &index,
+                        &index_path,
+                        &art_cache,
+                        emitter.clone(),
+                    )
+                    .await;
                 }
                 if let Some((node_id, _)) = routed_stream.take()
                     && let Err(err) = clear_stream_route(node_id).await
@@ -340,6 +460,261 @@ pub async fn run_daemon(config: Config, config_path: PathBuf) -> Result<()> {
                 break;
             }
 
+            Some(ipc_cmd) = async {
+                match cmd_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match ipc_cmd {
+                    IpcCommand::Shutdown => {
+                        info!("Received IPC shutdown command; stopping recorder");
+                        if let Some((pw, _)) = active_pw.take() {
+                            pw.stop().await;
+                        }
+                        if let Some(session) = active_session.take() {
+                            maybe_finalize_session(
+                                session,
+                                &config,
+                                &index,
+                                &index_path,
+                                &art_cache,
+                                emitter.clone(),
+                            )
+                            .await;
+                        }
+                        if let Some((node_id, _)) = routed_stream.take()
+                            && let Err(err) = clear_stream_route(node_id).await
+                        {
+                            debug!(node_id, error = %err, "Failed clearing target.object route on IPC shutdown");
+                        }
+                        if let Some(lb) = active_loopback.take() {
+                            lb.stop().await;
+                        }
+                        break;
+                    }
+                    IpcCommand::SetEnabled { enabled } => {
+                        if recording_enabled != enabled {
+                            recording_enabled = enabled;
+                            info!(recording_enabled, "Updated recording enabled state via IPC");
+                            if !recording_enabled {
+                                if let Some((pw, _)) = active_pw.take() {
+                                    pw.stop().await;
+                                }
+                                if let Some(ref mut session) = active_session {
+                                    session.skip_buffering = true;
+                                    session.pcm_samples.clear();
+                                    session.pcm_samples.shrink_to_fit();
+                                }
+                            } else {
+                                // Re-evaluate current player state cleanly (mid-track will skip until next track)
+                                active_session = None;
+                                if let Some(ref bus) = active_bus
+                                    && let Ok(snap) = query_player_snapshot(&conn, bus).await
+                                {
+                                    last_player = Some(snap.clone());
+                                    handle_snapshot(
+                                        &conn,
+                                        &config,
+                                        recording_enabled,
+                                        &index,
+                                        &index_path,
+                                        &art_cache,
+                                        emitter.as_ref(),
+                                        snap,
+                                        &mut active_session,
+                                        &mut paused_since,
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                    }
+                    IpcCommand::SetVirtualSink { enabled } => {
+                        config.stream.virtual_sink.enabled = enabled;
+                        info!(enabled, "Updated virtual sink setting via IPC");
+                        if enabled {
+                            ensure_virtual_sink_running(
+                                &config,
+                                &mut active_loopback,
+                                &mut active_virtual_sink,
+                                &mut routed_stream,
+                            )
+                            .await;
+                            if config.stream.virtual_sink.auto_route
+                                && let Ok(Some(node)) = find_target_node(&config.stream.pipewire_target).await
+                            {
+                                maybe_route_target_stream(
+                                    &config,
+                                    &node,
+                                    &active_virtual_sink,
+                                    &mut routed_stream,
+                                )
+                                .await;
+                                current_pw_node = Some(node);
+                            }
+                        } else {
+                            if let Some((node_id, _)) = routed_stream.take()
+                                && let Err(err) = clear_stream_route(node_id).await
+                            {
+                                debug!(node_id, error = %err, "Failed clearing target.object route");
+                            }
+                            if let Some(lb) = active_loopback.take() {
+                                lb.stop().await;
+                            }
+                            active_virtual_sink = None;
+                        }
+                    }
+                    IpcCommand::SetEnforceUnityVolume { enabled } => {
+                        config.stream.enforce_unity_volume = enabled;
+                        info!(enabled, "Updated enforce_unity_volume setting via IPC");
+                    }
+                    IpcCommand::SetTarget {
+                        mpris_player,
+                        pipewire_target,
+                    } => {
+                        info!(%mpris_player, %pipewire_target, "Switching recording target via IPC");
+                        if let Some((pw, _)) = active_pw.take() {
+                            pw.stop().await;
+                        }
+                        if let Some(session) = active_session.take() {
+                            maybe_finalize_session(
+                                session,
+                                &config,
+                                &index,
+                                &index_path,
+                                &art_cache,
+                                emitter.clone(),
+                            )
+                            .await;
+                        }
+                        if let Some((node_id, _)) = routed_stream.take() {
+                            let _ = clear_stream_route(node_id).await;
+                        }
+                        config.stream.mpris_player = mpris_player;
+                        config.stream.pipewire_target = pipewire_target;
+                        active_bus = find_active_player_bus(&conn, &config.stream.mpris_player)
+                            .await
+                            .ok()
+                            .flatten();
+                        active_owner = match active_bus.as_deref() {
+                            Some(bus) => resolve_name_owner(&conn, bus).await.ok(),
+                            None => None,
+                        };
+                        last_player = None;
+                        current_pw_node = None;
+                        paused_since = None;
+
+                        if let Some(ref bus) = active_bus
+                            && let Ok(snap) = query_player_snapshot(&conn, bus).await
+                        {
+                            last_player = Some(snap.clone());
+                            handle_snapshot(
+                                &conn,
+                                &config,
+                                recording_enabled,
+                                &index,
+                                &index_path,
+                                &art_cache,
+                                emitter.as_ref(),
+                                snap,
+                                &mut active_session,
+                                &mut paused_since,
+                            )
+                            .await;
+                        }
+                        if config.stream.virtual_sink.enabled
+                            && config.stream.virtual_sink.auto_route
+                            && let Ok(Some(node)) = find_target_node(&config.stream.pipewire_target).await
+                        {
+                            maybe_route_target_stream(
+                                &config,
+                                &node,
+                                &active_virtual_sink,
+                                &mut routed_stream,
+                            )
+                            .await;
+                            current_pw_node = Some(node);
+                        }
+                    }
+                    IpcCommand::GetRecent { limit } => {
+                        if let Some(ref em) = emitter {
+                            emit_recent_tracks(em, &index, limit.clamp(1, 200)).await;
+                        }
+                    }
+                    IpcCommand::ListStreams => {
+                        if let Some(ref em) = emitter {
+                            let mut mpris_players = Vec::new();
+                            if let Ok(buses) = list_mpris_players(&conn).await {
+                                for bus in buses {
+                                    let short_name = bus
+                                        .strip_prefix("org.mpris.MediaPlayer2.")
+                                        .unwrap_or(&bus)
+                                        .to_string();
+                                    let (status, track) = match query_player_snapshot(&conn, &bus).await {
+                                        Ok(snap) => {
+                                            let track = snap.metadata.as_ref().map(|m| {
+                                                format!("{} - {}", m.primary_artist(), m.title)
+                                            });
+                                            (IpcPlaybackStatus::from(&snap.status), track)
+                                        }
+                                        Err(_) => (IpcPlaybackStatus::Unknown, None),
+                                    };
+                                    mpris_players.push(IpcMprisPlayerInfo {
+                                        bus,
+                                        short_name,
+                                        status,
+                                        track,
+                                    });
+                                }
+                            }
+                            let pipewire_nodes = list_audio_output_streams()
+                                .await
+                                .unwrap_or_default()
+                                .iter()
+                                .map(IpcNodeState::from)
+                                .collect();
+                            em.emit(IpcEvent::Streams {
+                                mpris_players,
+                                pipewire_nodes,
+                            });
+                        }
+                    }
+                    IpcCommand::VerifyIndex => {
+                        let (removed, remaining) = {
+                            let mut guard = index.lock().await;
+                            let removed = guard.prune_missing();
+                            if let Err(err) = guard.save(&index_path)
+                                && let Some(ref em) = emitter
+                            {
+                                em.emit_error(format!("failed saving index: {err}"));
+                            }
+                            (removed, guard.entries.len())
+                        };
+                        if let Some(ref em) = emitter {
+                            em.emit(IpcEvent::IndexVerified { removed, remaining });
+                            emit_recent_tracks(em, &index, 15).await;
+                        }
+                    }
+                }
+
+                emit_snapshot_if_changed(
+                    emitter.as_ref(),
+                    &mut last_emitted,
+                    &config,
+                    recording_enabled,
+                    active_pw.is_some(),
+                    last_player.as_ref(),
+                    current_pw_node.as_ref(),
+                    active_virtual_sink.as_ref(),
+                    routed_stream,
+                    active_session.as_ref(),
+                    paused_since,
+                    &index,
+                )
+                .await;
+            }
+
             Some(pw_event) = async {
                 match active_pw.as_mut() {
                     Some((_, rx)) => rx.recv().await,
@@ -348,7 +723,9 @@ pub async fn run_daemon(config: Config, config_path: PathBuf) -> Result<()> {
             } => {
                 match pw_event {
                     PwStreamEvent::Samples(samples) => {
-                        if let Some(ref mut session) = active_session {
+                        if recording_enabled
+                            && let Some(ref mut session) = active_session
+                        {
                             session.push_samples(&samples);
                         }
                     }
@@ -383,6 +760,7 @@ pub async fn run_daemon(config: Config, config_path: PathBuf) -> Result<()> {
                         let body = msg.body();
                         if let Ok(pos_us) = body.deserialize::<i64>()
                             && let Some(ref mut session) = active_session
+                            && recording_enabled
                         {
                                 let elapsed_us = session.last_position_at.elapsed().as_micros() as i64;
                                 let expected_us = session.last_known_position_us + elapsed_us;
@@ -407,12 +785,15 @@ pub async fn run_daemon(config: Config, config_path: PathBuf) -> Result<()> {
                     }
                     Some("PropertiesChanged") => {
                         if let Ok(snap) = query_player_snapshot(&conn, bus).await {
+                            last_player = Some(snap.clone());
                             handle_snapshot(
                                 &conn,
                                 &config,
+                                recording_enabled,
                                 &index,
                                 &index_path,
                                 &art_cache,
+                                emitter.as_ref(),
                                 snap,
                                 &mut active_session,
                                 &mut paused_since,
@@ -421,6 +802,22 @@ pub async fn run_daemon(config: Config, config_path: PathBuf) -> Result<()> {
                     }
                     _ => {}
                 }
+
+                emit_snapshot_if_changed(
+                    emitter.as_ref(),
+                    &mut last_emitted,
+                    &config,
+                    recording_enabled,
+                    active_pw.is_some(),
+                    last_player.as_ref(),
+                    current_pw_node.as_ref(),
+                    active_virtual_sink.as_ref(),
+                    routed_stream,
+                    active_session.as_ref(),
+                    paused_since,
+                    &index,
+                )
+                .await;
             }
 
             Some(msg_res) = dbus_stream.next() => {
@@ -436,12 +833,15 @@ pub async fn run_daemon(config: Config, config_path: PathBuf) -> Result<()> {
                                 active_bus = Some(name.clone());
                                 active_owner = Some(new_owner);
                                 if let Ok(snap) = query_player_snapshot(&conn, &name).await {
+                                    last_player = Some(snap.clone());
                                     handle_snapshot(
                                         &conn,
                                         &config,
+                                        recording_enabled,
                                         &index,
                                         &index_path,
                                         &art_cache,
+                                        emitter.as_ref(),
                                         snap,
                                         &mut active_session,
                                         &mut paused_since,
@@ -451,8 +851,16 @@ pub async fn run_daemon(config: Config, config_path: PathBuf) -> Result<()> {
                                 info!(bus_name = %name, "Target MPRIS player closed");
                                 active_bus = None;
                                 active_owner = None;
+                                last_player = None;
                                 if let Some(session) = active_session.take() {
-                                    maybe_finalize_session(session, &config, &index, &index_path, &art_cache).await;
+                                    maybe_finalize_session(
+                                        session,
+                                        &config,
+                                        &index,
+                                        &index_path,
+                                        &art_cache,
+                                        emitter.clone(),
+                                    ).await;
                                 }
                                 if let Some((pw, _)) = active_pw.take() {
                                     pw.stop().await;
@@ -460,6 +868,21 @@ pub async fn run_daemon(config: Config, config_path: PathBuf) -> Result<()> {
                                 current_pw_node = None;
                                 routed_stream = None;
                             }
+                            emit_snapshot_if_changed(
+                                emitter.as_ref(),
+                                &mut last_emitted,
+                                &config,
+                                recording_enabled,
+                                active_pw.is_some(),
+                                last_player.as_ref(),
+                                current_pw_node.as_ref(),
+                                active_virtual_sink.as_ref(),
+                                routed_stream,
+                                active_session.as_ref(),
+                                paused_since,
+                                &index,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -472,12 +895,15 @@ pub async fn run_daemon(config: Config, config_path: PathBuf) -> Result<()> {
                         active_owner = resolve_name_owner(&conn, &bus).await.ok();
                         active_bus = Some(bus.clone());
                         if let Ok(snap) = query_player_snapshot(&conn, &bus).await {
+                            last_player = Some(snap.clone());
                             handle_snapshot(
                                 &conn,
                                 &config,
+                                recording_enabled,
                                 &index,
                                 &index_path,
                                 &art_cache,
+                                emitter.as_ref(),
                                 snap,
                                 &mut active_session,
                                 &mut paused_since,
@@ -487,7 +913,9 @@ pub async fn run_daemon(config: Config, config_path: PathBuf) -> Result<()> {
                 } else if let Some(ref bus) = active_bus {
                     // Periodic poll catches silent seeks or player volume changes that don't emit signals
                     if let Ok(snap) = query_player_snapshot(&conn, bus).await {
-                        if config.stream.enforce_unity_volume
+                        last_player = Some(snap.clone());
+                        if recording_enabled
+                            && config.stream.enforce_unity_volume
                             && let Some(vol) = snap.volume
                             && (vol - 1.0).abs() > 0.015
                             && let Some(ref mut session) = active_session
@@ -501,7 +929,8 @@ pub async fn run_daemon(config: Config, config_path: PathBuf) -> Result<()> {
                             session.invalidate(InvalidationReason::VolumeAttenuated);
                         }
 
-                        if let Some(ref mut session) = active_session
+                        if recording_enabled
+                            && let Some(ref mut session) = active_session
                             && snap.status == PlaybackStatus::Playing
                         {
                             let elapsed_us = session.last_position_at.elapsed().as_micros() as i64;
@@ -536,11 +965,13 @@ pub async fn run_daemon(config: Config, config_path: PathBuf) -> Result<()> {
                 }
 
                 // Manage PipeWire capture lifecycle, virtual-sink routing, and node volume monitoring
-                let should_capture = active_session
-                    .as_ref()
-                    .is_some_and(|s| !s.skip_buffering && paused_since.is_none());
+                let should_capture = recording_enabled
+                    && active_session
+                        .as_ref()
+                        .is_some_and(|s| !s.skip_buffering && paused_since.is_none());
                 let should_poll_node = should_capture
-                    || (config.stream.virtual_sink.enabled && config.stream.virtual_sink.auto_route);
+                    || (config.stream.virtual_sink.enabled && config.stream.virtual_sink.auto_route)
+                    || (emitter.is_some() && active_bus.is_some());
 
                 if should_poll_node {
                     match find_target_node(&config.stream.pipewire_target).await {
@@ -601,9 +1032,16 @@ pub async fn run_daemon(config: Config, config_path: PathBuf) -> Result<()> {
                                         }
                                         Err(err) => {
                                             error!("Failed to spawn pw-record: {}", err);
+                                            if let Some(ref em) = emitter {
+                                                em.emit_error(format!("failed to spawn pw-record: {err}"));
+                                            }
                                         }
                                     }
+                                } else {
+                                    current_pw_node = Some(node);
                                 }
+                            } else {
+                                current_pw_node = Some(node);
                             }
                         }
                         Ok(None) => {
@@ -613,6 +1051,7 @@ pub async fn run_daemon(config: Config, config_path: PathBuf) -> Result<()> {
                                     target = %config.stream.pipewire_target,
                                     "PipeWire output stream not currently present"
                                 );
+                                current_pw_node = None;
                             }
                         }
                         Err(err) => {
@@ -628,8 +1067,23 @@ pub async fn run_daemon(config: Config, config_path: PathBuf) -> Result<()> {
                 {
                     info!("Stopping pw-record after idle timeout");
                     pw.stop().await;
-                    current_pw_node = None;
                 }
+
+                emit_snapshot_if_changed(
+                    emitter.as_ref(),
+                    &mut last_emitted,
+                    &config,
+                    recording_enabled,
+                    active_pw.is_some(),
+                    last_player.as_ref(),
+                    current_pw_node.as_ref(),
+                    active_virtual_sink.as_ref(),
+                    routed_stream,
+                    active_session.as_ref(),
+                    paused_since,
+                    &index,
+                )
+                .await;
             }
         }
     }
@@ -752,9 +1206,11 @@ async fn maybe_route_target_stream(
 async fn handle_snapshot(
     conn: &Connection,
     config: &Config,
+    recording_enabled: bool,
     index: &Arc<Mutex<RecordedIndex>>,
     index_path: &Path,
     art_cache: &Arc<Mutex<CoverArtCache>>,
+    emitter: Option<&IpcEmitter>,
     snap: PlayerSnapshot,
     active_session: &mut Option<RecordingSession>,
     paused_since: &mut Option<Instant>,
@@ -775,7 +1231,7 @@ async fn handle_snapshot(
                     if current.meta.album.is_empty() && !meta.album.is_empty() {
                         current.meta.album = meta.album;
                     }
-                    if was_paused && !current.skip_buffering {
+                    if was_paused && recording_enabled && !current.skip_buffering {
                         if (snap.position_us - current.last_known_position_us).abs() > 2_500_000 {
                             current.invalidate(InvalidationReason::SeekDetected {
                                 jump_ms: (snap.position_us - current.last_known_position_us) / 1000,
@@ -790,11 +1246,19 @@ async fn handle_snapshot(
 
                 // Track changed! Finalize previous session before starting the new one.
                 if let Some(prev) = active_session.take() {
-                    maybe_finalize_session(prev, config, index, index_path, art_cache).await;
+                    maybe_finalize_session(
+                        prev,
+                        config,
+                        index,
+                        index_path,
+                        art_cache,
+                        emitter.cloned(),
+                    )
+                    .await;
                 }
             }
 
-            if config.stream.enforce_unity_volume {
+            if recording_enabled && config.stream.enforce_unity_volume {
                 if let Some(vol) = snap.volume
                     && (vol - 1.0).abs() > 0.015
                 {
@@ -816,7 +1280,9 @@ async fn handle_snapshot(
             }
 
             let offset_ms = (snap.position_us.max(0) as u64) / 1000;
-            let skip_reason = if meta.is_advertisement() {
+            let skip_reason = if !recording_enabled {
+                None
+            } else if meta.is_advertisement() {
                 Some(InvalidationReason::Advertisement)
             } else if let Some(existing) = index.lock().await.find_duplicate(config, &meta) {
                 Some(InvalidationReason::Duplicate(existing))
@@ -829,31 +1295,37 @@ async fn handle_snapshot(
                 None
             };
 
-            if let Some(ref reason) = skip_reason {
-                info!(
-                    title = %meta.title,
-                    artist = %meta.primary_artist(),
-                    reason = %reason,
-                    "Skipping track"
-                );
-            } else {
-                info!(
-                    title = %meta.title,
-                    artist = %meta.primary_artist(),
-                    album = %meta.album,
-                    duration_s = meta.duration_ms() / 1000,
-                    "Recording started"
-                );
+            if recording_enabled {
+                if let Some(ref reason) = skip_reason {
+                    info!(
+                        title = %meta.title,
+                        artist = %meta.primary_artist(),
+                        reason = %reason,
+                        "Skipping track"
+                    );
+                } else {
+                    info!(
+                        title = %meta.title,
+                        artist = %meta.primary_artist(),
+                        album = %meta.album,
+                        duration_s = meta.duration_ms() / 1000,
+                        "Recording started"
+                    );
+                }
             }
 
-            *active_session = Some(RecordingSession::new(
+            let mut session = RecordingSession::new(
                 meta,
                 config.stream.sample_rate,
                 config.stream.channels,
                 offset_ms,
                 snap.position_us,
                 skip_reason,
-            ));
+            );
+            if !recording_enabled {
+                session.skip_buffering = true;
+            }
+            *active_session = Some(session);
         }
 
         PlaybackStatus::Paused | PlaybackStatus::Stopped => {
@@ -861,17 +1333,24 @@ async fn handle_snapshot(
                 *paused_since = Some(Instant::now());
             }
 
-            if let Some(session) = active_session.as_mut()
+            if recording_enabled
+                && let Some(session) = active_session.as_mut()
                 && !session.skip_buffering
             {
                 if validate_completeness(session, config).is_ok() {
                     // Track reached its full length (e.g. end of album/queue)
                     if let Some(finished) = active_session.take() {
-                        maybe_finalize_session(finished, config, index, index_path, art_cache)
-                            .await;
+                        maybe_finalize_session(
+                            finished,
+                            config,
+                            index,
+                            index_path,
+                            art_cache,
+                            emitter.cloned(),
+                        )
+                        .await;
                     }
-                } else if snap.status == PlaybackStatus::Stopped
-                    || !config.completeness.allow_pause
+                } else if snap.status == PlaybackStatus::Stopped || !config.completeness.allow_pause
                 {
                     let reason = if snap.status == PlaybackStatus::Stopped {
                         InvalidationReason::TooShort {
@@ -901,7 +1380,12 @@ async fn maybe_finalize_session(
     index: &Arc<Mutex<RecordedIndex>>,
     index_path: &Path,
     art_cache: &Arc<Mutex<CoverArtCache>>,
+    emitter: Option<IpcEmitter>,
 ) {
+    if session.skip_buffering && session.invalidated.is_none() {
+        return;
+    }
+
     if let Err(reason) = validate_completeness(&session, config) {
         if !matches!(
             reason,
@@ -970,11 +1454,15 @@ async fn maybe_finalize_session(
         .await
         {
             Ok(()) => {
-                let mut guard = idx.lock().await;
-                guard.record_entry(&session.meta, output_path.clone(), captured_ms);
-                if let Err(err) = guard.save(&idx_path) {
-                    error!("Failed saving recorded index: {}", err);
-                }
+                let (saved_entry, index_count) = {
+                    let mut guard = idx.lock().await;
+                    guard.record_entry(&session.meta, output_path.clone(), captured_ms);
+                    if let Err(err) = guard.save(&idx_path) {
+                        error!("Failed saving recorded index: {}", err);
+                    }
+                    let entry = guard.entries.last().map(IpcRecordedEntry::from);
+                    (entry, guard.entries.len())
+                };
                 info!(
                     title = %session.meta.title,
                     artist = %session.meta.primary_artist(),
@@ -982,6 +1470,12 @@ async fn maybe_finalize_session(
                     duration_s = captured_ms / 1000,
                     "Saved complete track"
                 );
+                if let Some(ref em) = emitter {
+                    if let Some(entry) = saved_entry {
+                        em.emit(IpcEvent::TrackSaved { entry, index_count });
+                    }
+                    emit_recent_tracks(em, &idx, 15).await;
+                }
             }
             Err(err) => {
                 error!(
@@ -989,6 +1483,9 @@ async fn maybe_finalize_session(
                     error = %err,
                     "Failed encoding/tagging FLAC"
                 );
+                if let Some(ref em) = emitter {
+                    em.emit_error(format!("Failed saving \"{}\": {err}", session.meta.title));
+                }
             }
         }
     });

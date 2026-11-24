@@ -231,7 +231,9 @@ mod tests {
         let rendered = render_track_path(&cfg, &meta);
         assert_eq!(
             rendered,
-            PathBuf::from("/music/out/Pink Floyd/The Dark Side of the Moon/04 - Time_ Pink_Floyd_.flac")
+            PathBuf::from(
+                "/music/out/Pink Floyd/The Dark Side of the Moon/04 - Time_ Pink_Floyd_.flac"
+            )
         );
     }
 

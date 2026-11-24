@@ -301,7 +301,9 @@ fn expand_path_str(raw: &str) -> PathBuf {
 
 pub fn expand_path_with_home(raw: &str, home: Option<&Path>) -> PathBuf {
     if raw == "~" {
-        return home.map(PathBuf::from).unwrap_or_else(|| PathBuf::from(raw));
+        return home
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(raw));
     }
     if let Some(rest) = raw.strip_prefix("~/")
         && let Some(home_dir) = home
@@ -322,7 +324,10 @@ mod tests {
         assert!(cfg.stream.enforce_unity_volume);
         assert!(!cfg.stream.virtual_sink.enabled);
         assert!(cfg.stream.virtual_sink.auto_route);
-        assert_eq!(cfg.stream.virtual_sink.sink_name, "pipewire_recorder_capture");
+        assert_eq!(
+            cfg.stream.virtual_sink.sink_name,
+            "pipewire_recorder_capture"
+        );
         assert_eq!(
             cfg.stream.virtual_sink.playback_node_name(),
             "pipewire_recorder_capture.playback"
@@ -345,7 +350,10 @@ mod tests {
         let (cfg, _) = Config::load_or_init_in_dir(dir.path(), None).unwrap();
         assert!(cfg.stream.virtual_sink.enabled);
         assert_eq!(cfg.stream.virtual_sink.playback_name, "Spotify Lautstärke");
-        assert_eq!(cfg.stream.virtual_sink.sink_name, "pipewire_recorder_capture");
+        assert_eq!(
+            cfg.stream.virtual_sink.sink_name,
+            "pipewire_recorder_capture"
+        );
         assert!(cfg.stream.virtual_sink.auto_route);
         assert!(cfg.stream.virtual_sink.playback_target.is_none());
     }

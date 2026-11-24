@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
+use zbus::Connection;
 use zbus::names::{BusName, InterfaceName};
 use zbus::proxy::CacheProperties;
 use zbus::zvariant::{OwnedValue, Value};
-use zbus::Connection;
 
 const MPRIS_PREFIX: &str = "org.mpris.MediaPlayer2.";
 const MPRIS_PATH: &str = "/org/mpris/MediaPlayer2";
